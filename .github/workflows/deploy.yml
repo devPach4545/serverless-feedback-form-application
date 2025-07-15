@@ -49,6 +49,9 @@ jobs:
 
       - name: SAM Build
         run: sam build --use-container
+      
+      - name: Clear Sam config
+        run : rm -f samconfig.toml
 
       - name: SAM Deploy
         run: >
