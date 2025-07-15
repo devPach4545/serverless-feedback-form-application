@@ -203,7 +203,7 @@ Resources:
       Role: !GetAtt FeedbackValidatorRole.Arn
       Environment:
         Variables:
-          StepFunctionArn: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${FeedbackStateMachine}"
+          StepFunctionArn: !Ref FeedbackStateMachine
       Events:
         ApiEvent:
           Type: Api
