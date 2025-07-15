@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  A serverless application for collecting, analyzing, and storing user feedback.
+
+Parameters:
+  SnsEmailParameter:
+    Type: String
+    Description: The email address to receive notifications for negative feedback.
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: python3.9
+    MemorySize: 128
+
+Resources:
+  # 1. API Gateway (The public entry point)
+  FeedbackApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - Content-Type
+
+  # 2. DynamoDB Table (Our database)
+  FeedbackTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      PrimaryKey:
+        Name: id
+        Type: String
+      TableName: FeedbackTable
+
+  # 3. SNS Topic (For sending alerts)
+  NegativeFeedbackTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: NegativeFeedbackTopic
+
+  NegativeFeedbackSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref SnsEmailParameter
+      TopicArn: !Ref NegativeFeedbackTopic
+
+  # 4. Step Function State Machine (The workflow orchestrator)
+  FeedbackWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: FeedbackProcessingWorkflow
+      Definition:
+        Comment: "A state machine that processes user feedback."
+        StartAt: AnalyzeSentiment
+        States:
+          AnalyzeSentiment:
+            Type: Task
+            Resource: !GetAtt SentimentAnalyzerFunction.Arn
+            Next: IsSentimentNegative
+          IsSentimentNegative:
+            Type: Choice
+            Choices:
+              - Variable: "$.sentiment"
+                StringEquals: "NEGATIVE"
+                Next: PublishNegativeAlert
+            Default: PersistData
+          PublishNegativeAlert:
+            Type: Task
+            Resource: !GetAtt AlertPublisherFunction.Arn
+            Next: PersistData
+          PersistData:
+            Type: Task
+            Resource: !GetAtt DataPersisterFunction.Arn
+            End: true
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SentimentAnalyzerFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AlertPublisherFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DataPersisterFunction
+
+  # 5. Lambda Functions (The serverless compute)
+  FeedbackValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/feedback-validator/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref FeedbackWorkflow
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt FeedbackWorkflow.Name
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            Path: /feedback
+            Method: post
+            ApiId: !Ref FeedbackApi
+
+  SentimentAnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/sentiment-analyzer/
+      Handler: app.lambda_handler
+      Policies:
+        - ComprehendReadOnlyPolicy: {}
+
+  DataPersisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/data-persister/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FeedbackTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeedbackTable
+
+  AlertPublisherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/alert-publisher/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NegativeFeedbackTopic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NegativeFeedbackTopic.TopicName
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${FeedbackApi}.execute-api.${AWS::Region}.amazonaws.com/"
