@@ -173,7 +173,7 @@ Resources:
           SentimentChoiceState:
             Type: Choice
             Choices:
-              - Variable: '$.Payload.sentiment'
+              - Variable: '$.sentiment'
                 StringEquals: 'NEGATIVE'
                 Next: NegativeFeedbackAlertState
             Default: PersistDataState
