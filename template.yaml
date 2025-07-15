@@ -1,143 +1,247 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  A serverless application for collecting, analyzing, and storing user feedback.
+  serverless-feedback-form-application
+
+  Sample SAM Template for serverless-feedback-form-application
 
 Parameters:
-  SnsEmailParameter:
+  snsEmailParameter:
     Type: String
-    Description: The email address to receive notifications for negative feedback.
+    Description: SNS Email Address for Alert Notifications
+    
 
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
 Globals:
   Function:
-    Timeout: 10
-    Runtime: python3.9
+    Timeout: 3
     MemorySize: 128
+    LoggingConfig:
+      LogFormat: JSON
+  Api:
+    Cors:
+      AllowMethods: "'POST, OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+      AllowOrigin: "'*'"
 
 Resources:
-  # 1. API Gateway (The public entry point)
-  FeedbackApi:
-    Type: AWS::Serverless::HttpApi
-    Properties:
-      CorsConfiguration:
-        AllowOrigins:
-          - "*"
-        AllowMethods:
-          - POST
-        AllowHeaders:
-          - Content-Type
 
-  # 2. DynamoDB Table (Our database)
+  SentimentAnalyzerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ComprehendPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'comprehend:DetectSentiment'
+                Resource: '*'
+
+  DataPersisterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                Resource: !GetAtt FeedbackTable.Arn
+
+  AlertPublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref NegativeFeedbackAlertTopic
+
+  FeedbackValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FeedbackValidationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !Ref FeedbackStateMachine
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt SentimentAnalyzerFunction.Arn
+                  - !GetAtt DataPersisterFunction.Arn
+                  - !GetAtt AlertPublisherFunction.Arn
+
   FeedbackTable:
     Type: AWS::Serverless::SimpleTable
     Properties:
+      TableName: FeedbackTable
       PrimaryKey:
         Name: id
         Type: String
-      TableName: FeedbackTable
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
 
-  # 3. SNS Topic (For sending alerts)
-  NegativeFeedbackTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: NegativeFeedbackTopic
-
-  NegativeFeedbackSubscription:
-    Type: AWS::SNS::Subscription
-    Properties:
-      Protocol: email
-      Endpoint: !Ref SnsEmailParameter
-      TopicArn: !Ref NegativeFeedbackTopic
-
-  # 4. Step Function State Machine (The workflow orchestrator)
-  FeedbackWorkflow:
+  FeedbackStateMachine:
     Type: AWS::Serverless::StateMachine
     Properties:
       Name: FeedbackProcessingWorkflow
+      Role: !GetAtt StateMachineRole.Arn
       Definition:
-        Comment: "A state machine that processes user feedback."
-        StartAt: AnalyzeSentiment
+        Comment: 'A state machine that processes user feedback.'
+        StartAt: AnalyzeSentimentState
         States:
-          AnalyzeSentiment:
+          AnalyzeSentimentState:
             Type: Task
             Resource: !GetAtt SentimentAnalyzerFunction.Arn
-            Next: IsSentimentNegative
-          IsSentimentNegative:
+            Next: SentimentChoiceState
+          SentimentChoiceState:
             Type: Choice
             Choices:
-              - Variable: "$.sentiment"
-                StringEquals: "NEGATIVE"
-                Next: PublishNegativeAlert
-            Default: PersistData
-          PublishNegativeAlert:
+              - Variable: '$.Payload.sentiment'
+                StringEquals: 'NEGATIVE'
+                Next: NegativeFeedbackAlertState
+            Default: PersistDataState
+          NegativeFeedbackAlertState:
             Type: Task
             Resource: !GetAtt AlertPublisherFunction.Arn
-            Next: PersistData
-          PersistData:
+            Next: PersistDataState
+          PersistDataState:
             Type: Task
             Resource: !GetAtt DataPersisterFunction.Arn
             End: true
-      Policies:
-        - LambdaInvokePolicy:
-            FunctionName: !Ref SentimentAnalyzerFunction
-        - LambdaInvokePolicy:
-            FunctionName: !Ref AlertPublisherFunction
-        - LambdaInvokePolicy:
-            FunctionName: !Ref DataPersisterFunction
 
-  # 5. Lambda Functions (The serverless compute)
+  NegativeFeedbackAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: NegativeFeedbackAlertTopic
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref snsEmailParameter
+
   FeedbackValidatorFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/feedback-validator/
       Handler: app.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt FeedbackValidatorRole.Arn
       Environment:
         Variables:
-          STATE_MACHINE_ARN: !Ref FeedbackWorkflow
-      Policies:
-        - StepFunctionsExecutionPolicy:
-            StateMachineName: !GetAtt FeedbackWorkflow.Name
+          StepFunctionArn: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${FeedbackStateMachine}"
       Events:
         ApiEvent:
-          Type: HttpApi
+          Type: Api
           Properties:
             Path: /feedback
             Method: post
-            ApiId: !Ref FeedbackApi
 
   SentimentAnalyzerFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/sentiment-analyzer/
       Handler: app.lambda_handler
-      Policies:
-        - ComprehendReadOnlyPolicy: {}
-
+      Runtime: python3.9
+      Role: !GetAtt SentimentAnalyzerRole.Arn
+  
   DataPersisterFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/data-persister/
       Handler: app.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt DataPersisterRole.Arn
       Environment:
         Variables:
           TABLE_NAME: !Ref FeedbackTable
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref FeedbackTable
 
   AlertPublisherFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/alert-publisher/
       Handler: app.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt AlertPublisherRole.Arn
       Environment:
         Variables:
-          SNS_TOPIC_ARN: !Ref NegativeFeedbackTopic
-      Policies:
-        - SNSPublishMessagePolicy:
-            TopicName: !GetAtt NegativeFeedbackTopic.TopicName
-
+          TOPIC_ARN: !Ref NegativeFeedbackAlertTopic
+      
 Outputs:
-  ApiEndpoint:
-    Description: "API Gateway endpoint URL"
-    Value: !Sub "https://${FeedbackApi}.execute-api.${AWS::Region}.amazonaws.com/"
+  FeedbackApiUrl:
+    Description: "API Gateway endpoint URL for Prod stage for the feedback function"
+    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/feedback/'
